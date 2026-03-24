@@ -22,7 +22,7 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 WORKBOOK_DEFAULT = "2025_2026 Invigilation (Semester 1).xlsx"
-CONTACTS_DEFAULT = "invigilators_template.csv"
+CONTACTS_DEFAULT = "invigilators_template-2(3).csv"
 STATE_LOG_DEFAULT = "sent_reminders.csv"
 NS = {
     "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
