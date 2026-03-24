@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Send invigilation reminder emails from the UG worksheet.
 
-This script reads the UG sheet from the workbook, matches invigilator names to email
-addresses in a CSV file, and sends reminders for exams occurring a configurable
-number of days in the future.
+The script reads the UG worksheet from the semester workbook, matches invigilator
+names to contact details from a CSV file, and sends reminders for exams occurring a
+configurable number of days in the future.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 WORKBOOK_DEFAULT = "2025_2026 Invigilation (Semester 1).xlsx"
+CONTACTS_DEFAULT = "invigilators_template.csv"
+STATE_LOG_DEFAULT = "sent_reminders.csv"
 NS = {
     "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
     "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
@@ -36,6 +38,13 @@ class Assignment:
     course: str
     venue: str
     invigilators: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Contact:
+    name: str
+    email: str
+    display_name: str
 
 
 def col_to_num(col: str) -> int:
@@ -63,7 +72,10 @@ def locate_sheet(zip_file: ZipFile, sheet_name: str) -> str:
         rel.attrib["Id"]: rel.attrib["Target"]
         for rel in relationships.findall("pkgrel:Relationship", NS)
     }
-    for sheet in workbook.find("main:sheets", NS):
+    sheets = workbook.find("main:sheets", NS)
+    if sheets is None:
+        raise ValueError("Workbook does not contain any visible worksheets.")
+    for sheet in sheets:
         if sheet.attrib["name"].lower() == sheet_name.lower():
             rel_id = sheet.attrib[
                 "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
@@ -105,7 +117,16 @@ def parse_exam_date(day_label: str) -> date:
     parts = day_label.split()
     if len(parts) < 2:
         raise ValueError(f"Could not parse exam date from '{day_label}'.")
-    return datetime.strptime(parts[-1], "%d/%m/%Y").date()
+    day_token = parts[-1]
+    for fmt in ("%d/%m/%Y", "%d/%-m/%Y"):
+        try:
+            if "%-m" in fmt and os.name == "nt":
+                continue
+            return datetime.strptime(day_token, fmt).date()
+        except ValueError:
+            continue
+    day, month, year = day_token.split("/")
+    return date(int(year), int(month), int(day))
 
 
 def parse_assignments(path: Path, sheet_name: str = "UG") -> list[Assignment]:
@@ -124,7 +145,10 @@ def parse_assignments(path: Path, sheet_name: str = "UG") -> list[Assignment]:
         venue = row.get(5)
         invigilators = row.get(6)
 
-        if not any(value is not None for value in (day_label, time_label, course, venue, invigilators)):
+        if not any(
+            value is not None
+            for value in (day_label, time_label, course, venue, invigilators)
+        ):
             continue
 
         if day_label:
@@ -134,7 +158,7 @@ def parse_assignments(path: Path, sheet_name: str = "UG") -> list[Assignment]:
         if course:
             current_course = course.strip()
 
-        if venue and invigilators:
+        if venue and invigilators and current_day and current_time and current_course:
             invigilator_list = tuple(
                 item.strip() for item in invigilators.split(",") if item.strip()
             )
@@ -152,8 +176,7 @@ def parse_assignments(path: Path, sheet_name: str = "UG") -> list[Assignment]:
     return assignments
 
 
-def load_invigilator_emails(path: Path) -> dict[str, str]:
-    mapping: dict[str, str] = {}
+def load_contacts(path: Path) -> dict[str, Contact]:
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         required = {"invigilator_name", "email"}
@@ -161,21 +184,35 @@ def load_invigilator_emails(path: Path) -> dict[str, str]:
             raise ValueError(
                 f"CSV file must contain headers: {', '.join(sorted(required))}."
             )
+
+        mapping: dict[str, Contact] = {}
         for row in reader:
             name = (row.get("invigilator_name") or "").strip()
             email = (row.get("email") or "").strip()
+            display_name = (row.get("display_name") or name).strip()
             if name and email:
-                mapping[name] = email
-    return mapping
+                mapping[name] = Contact(name=name, email=email, display_name=display_name)
+        return mapping
 
 
-def build_email(sender: str, recipient: str, days_before: int, assignments: Iterable[Assignment]) -> EmailMessage:
-    grouped = sorted(assignments, key=lambda item: (item.exam_date, item.time_label, item.course, item.venue))
+def build_email(
+    sender: str,
+    contact: Contact,
+    days_before: int,
+    assignments: Iterable[Assignment],
+) -> EmailMessage:
+    grouped = sorted(
+        assignments,
+        key=lambda item: (item.exam_date, item.time_label, item.course, item.venue),
+    )
     first_exam = grouped[0]
-    subject = f"Reminder: Invigilation duty for {first_exam.course} on {first_exam.exam_date:%d %b %Y}"
+    subject = (
+        f"Reminder: Invigilation duty for {first_exam.course} on "
+        f"{first_exam.exam_date:%d %b %Y}"
+    )
 
     lines = [
-        f"Dear {recipient.split('@')[0]},",
+        f"Dear {contact.display_name},",
         "",
         f"This is your automated reminder that you have invigilation duties in {days_before} day(s).",
         "",
@@ -197,10 +234,47 @@ def build_email(sender: str, recipient: str, days_before: int, assignments: Iter
 
     message = EmailMessage()
     message["From"] = sender
-    message["To"] = recipient
+    message["To"] = contact.email
     message["Subject"] = subject
     message.set_content("\n".join(lines))
     return message
+
+
+def load_sent_keys(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        return {row["reminder_key"] for row in reader if row.get("reminder_key")}
+
+
+def append_sent_log(path: Path, sent_rows: list[dict[str, str]]) -> None:
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "reminder_key",
+                "recipient_email",
+                "exam_date",
+                "generated_at_utc",
+            ],
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerows(sent_rows)
+
+
+def make_reminder_key(contact: Contact, assignments: Iterable[Assignment], days_before: int) -> str:
+    grouped = sorted(
+        assignments,
+        key=lambda item: (item.exam_date, item.time_label, item.course, item.venue),
+    )
+    session_key = ";".join(
+        f"{item.exam_date.isoformat()}|{item.time_label}|{item.course}|{item.venue}"
+        for item in grouped
+    )
+    return f"{days_before}|{contact.email}|{session_key}"
 
 
 def send_messages(sender: str, app_password: str, messages: Iterable[EmailMessage]) -> None:
@@ -210,7 +284,7 @@ def send_messages(sender: str, app_password: str, messages: Iterable[EmailMessag
             server.send_message(message)
 
 
-def main() -> int:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workbook", default=WORKBOOK_DEFAULT, help="Path to the Excel workbook.")
     parser.add_argument(
@@ -220,7 +294,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--contacts",
-        default="invigilators_template.csv",
+        default=CONTACTS_DEFAULT,
         help="CSV file mapping invigilator names to email addresses.",
     )
     parser.add_argument(
@@ -234,16 +308,38 @@ def main() -> int:
         help="Override today's date (YYYY-MM-DD) for testing the reminder selection.",
     )
     parser.add_argument(
+        "--sender",
+        default=os.environ.get("GMAIL_SENDER"),
+        help="Gmail address to send from. Defaults to GMAIL_SENDER.",
+    )
+    parser.add_argument(
+        "--app-password",
+        default=os.environ.get("GMAIL_APP_PASSWORD"),
+        help="Gmail app password. Defaults to GMAIL_APP_PASSWORD.",
+    )
+    parser.add_argument(
+        "--state-log",
+        default=STATE_LOG_DEFAULT,
+        help="CSV file used to prevent duplicate reminder sends.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print emails that would be sent without connecting to Gmail.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Send reminders even if they already appear in the state log.",
+    )
+    return parser.parse_args()
 
+
+def main() -> int:
+    args = parse_args()
     workbook = Path(args.workbook)
     contacts_path = Path(args.contacts)
-    sender = os.environ.get("GMAIL_SENDER")
-    app_password = os.environ.get("GMAIL_APP_PASSWORD")
+    state_log_path = Path(args.state_log)
 
     if not workbook.exists():
         raise SystemExit(f"Workbook not found: {workbook}")
@@ -251,25 +347,24 @@ def main() -> int:
         raise SystemExit(f"Contacts CSV not found: {contacts_path}")
 
     assignments = parse_assignments(workbook, args.sheet)
-    contact_map = load_invigilator_emails(contacts_path)
-
+    contact_map = load_contacts(contacts_path)
     base_date = (
         datetime.strptime(args.target_date, "%Y-%m-%d").date()
         if args.target_date
         else date.today()
     )
     reminder_date = base_date + timedelta(days=args.days_before)
+    sent_keys = set() if args.force else load_sent_keys(state_log_path)
 
-    by_recipient: dict[str, list[Assignment]] = defaultdict(list)
+    assignments_by_contact: dict[str, list[Assignment]] = defaultdict(list)
     missing_contacts: set[str] = set()
-
     for assignment in assignments:
         if assignment.exam_date != reminder_date:
             continue
         for invigilator in assignment.invigilators:
-            email = contact_map.get(invigilator)
-            if email:
-                by_recipient[email].append(assignment)
+            contact = contact_map.get(invigilator)
+            if contact:
+                assignments_by_contact[contact.name].append(assignment)
             else:
                 missing_contacts.add(invigilator)
 
@@ -279,31 +374,49 @@ def main() -> int:
             print(f"- {name}")
         print()
 
-    if not by_recipient:
+    pending_messages: list[tuple[str, Contact, EmailMessage]] = []
+    for contact_name, items in sorted(assignments_by_contact.items()):
+        contact = contact_map[contact_name]
+        reminder_key = make_reminder_key(contact, items, args.days_before)
+        if reminder_key in sent_keys:
+            continue
+        sender = args.sender or "your_gmail@gmail.com"
+        pending_messages.append(
+            (reminder_key, contact, build_email(sender, contact, args.days_before, items))
+        )
+
+    if not pending_messages:
         print(f"No reminders to send for exams on {reminder_date:%Y-%m-%d}.")
         return 0
 
-    messages = [
-        build_email(sender or "your_gmail@gmail.com", email, args.days_before, items)
-        for email, items in sorted(by_recipient.items())
-    ]
-
     if args.dry_run:
-        print(f"Dry run: {len(messages)} reminder(s) would be sent for exams on {reminder_date:%Y-%m-%d}.")
-        for message in messages:
+        print(
+            f"Dry run: {len(pending_messages)} reminder(s) would be sent for exams on {reminder_date:%Y-%m-%d}."
+        )
+        for _, _, message in pending_messages:
             print("=" * 72)
             print(f"To: {message['To']}")
             print(f"Subject: {message['Subject']}")
             print(message.get_content())
         return 0
 
-    if not sender or not app_password:
+    if not args.sender or not args.app_password:
         raise SystemExit(
-            "Set GMAIL_SENDER and GMAIL_APP_PASSWORD before sending live emails."
+            "Provide Gmail credentials via --sender/--app-password or the GMAIL_SENDER and GMAIL_APP_PASSWORD environment variables."
         )
 
-    send_messages(sender, app_password, messages)
-    print(f"Sent {len(messages)} reminder(s) for exams on {reminder_date:%Y-%m-%d}.")
+    send_messages(args.sender, args.app_password, [message for _, _, message in pending_messages])
+    sent_rows = [
+        {
+            "reminder_key": reminder_key,
+            "recipient_email": contact.email,
+            "exam_date": reminder_date.isoformat(),
+            "generated_at_utc": datetime.utcnow().replace(microsecond=0).isoformat(),
+        }
+        for reminder_key, contact, _ in pending_messages
+    ]
+    append_sent_log(state_log_path, sent_rows)
+    print(f"Sent {len(pending_messages)} reminder(s) for exams on {reminder_date:%Y-%m-%d}.")
     return 0
 
 

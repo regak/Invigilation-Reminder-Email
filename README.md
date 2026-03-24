@@ -3,18 +3,21 @@
 This repository contains a lightweight Python script for sending automated Gmail reminders to invigilators before their exam day.
 
 ## Files
-- `send_invigilation_reminders.py` parses the `UG` worksheet from `2025_2026 Invigilation (Semester 1).xlsx`, matches invigilators to recipient emails, and sends reminders.
-- `invigilators_template.csv` is the template you can fill in with the real email addresses for each invigilator.
+- `send_invigilation_reminders.py` parses the `UG` worksheet from `2025_2026 Invigilation (Semester 1).xlsx`, matches invigilators to recipient emails, prevents duplicate sends with a state log, and sends reminders.
+- `invigilators_template.csv` is the template you can fill in with the real display names and email addresses for each invigilator.
+- `.gitignore` keeps local credentials, state logs, and cache files out of git.
 
 ## Setup
-1. Fill in `invigilators_template.csv` with the actual email addresses.
+1. Fill in `invigilators_template.csv` with the actual email addresses and preferred display names.
 2. Create a Gmail App Password for the Gmail account that will send reminders.
-3. Export these environment variables:
+3. Export your Gmail credentials locally (do **not** commit them):
 
 ```bash
 export GMAIL_SENDER="your_gmail@gmail.com"
 export GMAIL_APP_PASSWORD="your_16_character_app_password"
 ```
+
+You can also pass the same values on the command line using `--sender` and `--app-password`.
 
 ## Dry run
 Use a dry run first to verify which reminders will be generated without sending email:
@@ -28,6 +31,15 @@ The example above previews reminders for exams scheduled on `2026-03-05`, becaus
 ## Send live reminders
 ```bash
 python send_invigilation_reminders.py
+```
+
+## Duplicate protection
+After a live run, the script writes reminder keys to `sent_reminders.csv` so the same reminder is not sent twice.
+
+If you need to resend anyway, use:
+
+```bash
+python send_invigilation_reminders.py --force
 ```
 
 ## Optional cron automation
