@@ -1,0 +1,5 @@
+__pycache__/
+.env
+.env.*
+sent_reminders.csv
+reminder.log
